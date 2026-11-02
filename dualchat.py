@@ -1,8 +1,10 @@
 """DualChat: YouTube + Twitch live chat in one window, one box to reply to both."""
 import codecs
+import collections
 import ctypes
-import io
+import html
 import json
+import os
 import queue
 import re
 import socket
@@ -10,20 +12,20 @@ import ssl
 import sys
 import threading
 import time
-import tkinter as tk
 import urllib.error
 import urllib.parse
 import urllib.request
 import webbrowser
+from ctypes import wintypes
 from datetime import datetime
 from pathlib import Path
-from tkinter import font as tkfont, messagebox, scrolledtext
 
-from PIL import Image, ImageTk
+import webview
 
 # as an .exe, __file__ is in a temp unpack folder; config and tokens live next to the .exe
 HERE = Path(sys.executable if getattr(sys, "frozen", False) else __file__).resolve().parent
-ASSETS = Path(getattr(sys, "_MEIPASS", HERE))  # bundled files (the icon) unpack here in the .exe
+ASSETS = Path(getattr(sys, "_MEIPASS", HERE))  # bundled files (UI, icon) unpack here in the .exe
+CONFIG = HERE / "config.json"
 TOKENS = HERE / "tokens.json"
 YT_API = "https://www.googleapis.com/youtube/v3/"
 YT_STREAM = "https://youtube.googleapis.com/youtube/v3/liveChat/messages/stream"
@@ -34,6 +36,15 @@ YT_MEMBER_EVENTS = {"newSponsorEvent": "became a member!", "membershipGiftingEve
                     "memberMilestoneChatEvent": "hit a membership milestone!"}
 CFG = {}
 _token_lock = threading.Lock()
+
+
+def _open_in_browser(name, url, code):
+    webbrowser.open(url)
+
+
+# the window replaces these so sign-in happens inside the app
+DEVICE_PROMPT = _open_in_browser  # (platform, url, code) when a sign-in code is ready
+DEVICE_DONE = lambda name: None  # (platform) once that sign-in succeeded
 
 OAUTH = {
     "youtube": {"device": "https://oauth2.googleapis.com/device/code",
@@ -117,7 +128,7 @@ def device_login(name, creds, log):
     d = http(o["device"], form={"client_id": creds["client_id"], o["scope_param"]: o["scope"]})
     url = d.get("verification_url") or d["verification_uri"]  # Google / Twitch spelling
     log(f"{name}: sign in at {url}   code: {d['user_code']}")
-    webbrowser.open(url)
+    DEVICE_PROMPT(name, url, d["user_code"])
     poll = {**creds, "device_code": d["device_code"],
             "grant_type": "urn:ietf:params:oauth:grant-type:device_code"}
     if name == "twitch":
@@ -126,7 +137,9 @@ def device_login(name, creds, log):
     while time.time() < deadline:
         time.sleep(interval)
         try:
-            return http(o["token"], form=poll)
+            token = http(o["token"], form=poll)
+            DEVICE_DONE(name)
+            return token
         except urllib.error.HTTPError as e:
             err = error_body(e)
             reason = err.get("error") or err.get("message")  # Google / Twitch
@@ -377,209 +390,608 @@ class YouTube:
         http(YT_API + "liveChat/messages?part=snippet", body=body, token=get_token("youtube", self.ui.status))
 
 
-# ---- Emoji ----
-# Tk on Windows draws emoji in black and white and can't join sequences (skin tones, families, flags),
-# so each emoji is shown as a Twemoji image instead.
+# ---- Setup: keys, captured from the Google / Twitch pages or pasted in ----
 
-_EMOJI_BASE = r"[\U0001F000-\U0001FAFF]|[⌚⌛⏩-⏬⏰⏳◽◾☔☕♈-♓" \
-              r"♿⚓⚡⚪⚫⚽⚾⛄⛅⛎⛔⛪⛲⛳⛵⛺" \
-              r"⛽✅✊✋✨❌❎❓-❕❗❤➕-➗➰➿" \
-              r"⬛⬜⭐⭕]|[ -⯿〰〽㊗㊙]️"  # other symbols only with FE0F
-EMOJI_RE = re.compile(
-    r"[\U0001F1E6-\U0001F1FF]{2}"  # flags
-    r"|[0-9#*]️?⃣"  # keycaps
-    rf"|(?:{_EMOJI_BASE})[️\U0001F3FB-\U0001F3FF\U000E0020-\U000E007F]*"  # + skin tone / subdivision-flag tags
-    rf"(?:‍(?:{_EMOJI_BASE}|[ -⯿])[️\U0001F3FB-\U0001F3FF]*)*"  # ZWJ-joined parts
-)
-EMOJI_CDN = "https://cdn.jsdelivr.net/gh/jdecked/twemoji@15.1.0/assets/72x72/"
-_emoji_png = {}  # sequence -> PNG bytes, or None when Twemoji has no image for it
+PAGES = {
+    "google_project": ("https://console.cloud.google.com/projectcreate",
+                       "Sign in, then create a project (any name). Make sure it's selected at the top."),
+    "google_api": ("https://console.cloud.google.com/apis/library/youtube.googleapis.com",
+                   "Click Enable to turn on the YouTube Data API v3."),
+    "google_auth": ("https://console.cloud.google.com/auth/overview/create",
+                    "Any app name, your email, audience External, your email again, agree, Create."),
+    "google_audience": ("https://console.cloud.google.com/auth/audience",
+                        "Test users, Add users: the Google account that owns your channel, then Save."),
+    "google_client": ("https://console.cloud.google.com/auth/clients/create",
+                      "Type: TVs and Limited Input devices, then Create. DualChat saves the keys it shows."),
+    "twitch_security": ("https://www.twitch.tv/settings/security",
+                        "Turn on Two-Factor Authentication if it's off, then go back."),
+    "twitch_register": ("https://dev.twitch.tv/console/apps/create",
+                        "Any unique name, redirect URL http://localhost, category Chat Bot, client type Public, then Create."),
+    "twitch_apps": ("https://dev.twitch.tv/console/apps",
+                    "Click Manage on your DualChat app. DualChat saves its Client ID."),
+}
+GOOGLE_ID = r"\d{6,}-[a-z0-9]{20,}\.apps\.googleusercontent\.com"
+GOOGLE_ID_RE = re.compile(rf"\b{GOOGLE_ID}\b")
+GOOGLE_SECRET_RE = re.compile(r"\bGOCSPX-[A-Za-z0-9_-]{20,}")
+TWITCH_APP_RE = re.compile(r"^https://dev\.twitch\.tv/console/apps/([a-z0-9]{30})(?:[/?#]|$)")
 
 
-def twemoji_name(seq):
-    if "‍" not in seq:  # Twemoji drops FE0F except inside ZWJ sequences
-        seq = seq.replace("️", "")
-    return "-".join(f"{ord(c):x}" for c in seq)
+def capture_google(text):
+    """The client-created dialog shows exactly one ID and one secret; anything else is ambiguous."""
+    ids, secrets = set(GOOGLE_ID_RE.findall(text)), set(GOOGLE_SECRET_RE.findall(text))
+    return (ids.pop(), secrets.pop()) if len(ids) == 1 and len(secrets) == 1 else None
 
 
-def fetch_emoji(text):
-    """Download each new emoji's image once. Called on the chat threads so the window never waits on it."""
-    for seq in EMOJI_RE.findall(text):
-        if seq in _emoji_png:
-            continue
-        for name in dict.fromkeys((twemoji_name(seq), twemoji_name(seq.replace("️", "")))):
-            try:
-                with urllib.request.urlopen(EMOJI_CDN + name + ".png", timeout=5) as r:
-                    _emoji_png[seq] = r.read()
-                break
-            except urllib.error.HTTPError:
-                _emoji_png[seq] = None  # no such image: show the plain character
-            except (urllib.error.URLError, OSError):
-                break  # offline: leave uncached so it's retried next time
+def capture_twitch(url):
+    m = TWITCH_APP_RE.match(url or "")
+    return m and m.group(1)
+
+
+def check_keys(platform, vals):
+    """Validate pasted keys -> (dict to merge into CFG, error message or None)."""
+    vals = {k: (v or "").strip() for k, v in vals.items()}
+    if platform == "youtube":
+        if not re.fullmatch(GOOGLE_ID, vals.get("client_id", "")):
+            return None, "That Client ID doesn't look right. It ends in .apps.googleusercontent.com"
+        secret = vals.get("client_secret") or CFG.get("youtube", {}).get("client_secret", "")
+        if not re.fullmatch(r"[A-Za-z0-9_-]{16,}", secret):
+            return None, "Paste the Client secret too (it usually starts with GOCSPX-)"
+        return {"client_id": vals["client_id"], "client_secret": secret}, None
+    if not re.fullmatch(r"[a-z0-9]{30}", vals.get("client_id", "")):
+        return None, "A Twitch Client ID is 30 lowercase letters and numbers"
+    if not re.fullmatch(r"[A-Za-z0-9_]{0,25}", vals.get("channel", "").lstrip("#")):
+        return None, "Channel names only use letters, numbers and _"
+    return {"client_id": vals["client_id"], "channel": vals.get("channel", "").lstrip("#").lower()}, None
+
+
+def key(name, field):
+    """A saved key, or "" while it's still config.example.json's YOUR_... placeholder."""
+    v = CFG.get(name, {}).get(field) or ""
+    return "" if v.startswith("YOUR_") else v
+
+
+def is_ready(name):
+    return bool(key(name, "client_id")) and (name != "youtube" or bool(key(name, "client_secret")))
+
+
+def save_config():
+    """Write config.json atomically, so a crash mid-write can't destroy saved keys."""
+    tmp = CONFIG.with_suffix(".tmp")
+    tmp.write_text(json.dumps(CFG, indent=2), encoding="utf-8")
+    os.replace(tmp, CONFIG)
+
+
+FILL_CODE_JS = r"""
+(code => {
+  const i = [...document.querySelectorAll('input')].find(x => x.offsetParent && /^(text|tel|)$/.test(x.type));
+  if (!i || i.value) return false;
+  Object.getOwnPropertyDescriptor(HTMLInputElement.prototype, 'value').set.call(i, code);
+  i.dispatchEvent(new Event('input', {bubbles: true}));
+  return true;
+})
+"""
 
 
 # ---- Window ----
 
-def viewer_line(counts):
-    """[('YT', 12), ('TW', None)] -> 'YT 12   TW offline   Total 12'"""
-    parts = [f"{tag} {'offline' if n is None else n}" for tag, n in counts]
-    live = [n for _, n in counts if n is not None]
-    if len(counts) > 1 and live:
-        parts.append(f"Total {sum(live)}")
-    return "Viewers:   " + "   ".join(parts)
-
-
-THEMES = {
-    "dark": {"bg": "#0e0e10", "panel": "#18181b", "field": "#26262c", "text": "#efeff1", "border": "#3a3a3d",
-             "select": "#5c3fa3", "YT": "#ff6b6b", "TW": "#bf94ff", "sys": "#8a8a93", "alert": "#ffd75e"},
-    # chat colors darkened so they stay readable on white
-    "light": {"bg": "#e9e9ee", "panel": "#ffffff", "field": "#ffffff", "text": "#18181b", "border": "#c4c4cc",
-              "select": "#d4c2fb", "YT": "#c4170c", "TW": "#6a2fd8", "sys": "#6b6b76", "alert": "#9a5b00"},
+THEMES = {  # header colors, also used for the Windows title bar so the two blend together
+    "dark": {"hdr": (0x1A, 0x14, 0x24), "text": (0xEF, 0xEA, 0xF7), "bg": "#0F0D14", "panel": "#16131D",
+             "fg": "#EFEAF7", "ok": "#3DDC84"},
+    "light": {"hdr": (0xF3, 0xEE, 0xFB), "text": (0x1B, 0x17, 0x24), "bg": "#FAF8FD", "panel": "#FFFFFF",
+              "fg": "#1B1724", "ok": "#1E9E57"},
 }
+POPUP_W, POPUP_SLOT = 420, 150
+RESIZE_EDGES = {"top": 3, "topleft": 4, "topright": 5}  # WMSZ_* codes; sides and bottom keep the native border
+
+
+def hex_color(rgb):
+    return "#%02X%02X%02X" % rgb
+
+
+# ---- Custom title bar (Windows) ----
+# The window keeps its normal resizable frame, so snapping, Win+arrows, the shadow and side/bottom resizing all
+# still work; a window-procedure hook only drops the caption strip, and the page draws its own header and buttons.
+
+class _NCCALCSIZE_PARAMS(ctypes.Structure):
+    _fields_ = [("rgrc", wintypes.RECT * 3), ("lppos", ctypes.c_void_p)]
+
+
+_SUBCLASSPROC = ctypes.WINFUNCTYPE(ctypes.c_ssize_t, wintypes.HWND, wintypes.UINT, wintypes.WPARAM,
+                                   wintypes.LPARAM, ctypes.c_size_t, ctypes.c_size_t)
+if sys.platform == "win32":
+    _user32, _comctl32 = ctypes.windll.user32, ctypes.windll.comctl32
+    _comctl32.DefSubclassProc.argtypes = [wintypes.HWND, wintypes.UINT, wintypes.WPARAM, wintypes.LPARAM]
+    _comctl32.DefSubclassProc.restype = ctypes.c_ssize_t
+    _comctl32.SetWindowSubclass.argtypes = [wintypes.HWND, _SUBCLASSPROC, ctypes.c_size_t, ctypes.c_size_t]
+    _user32.SendMessageW.argtypes = [wintypes.HWND, wintypes.UINT, wintypes.WPARAM, wintypes.LPARAM]
+    _user32.SetWindowPos.argtypes = [wintypes.HWND, wintypes.HWND] + [ctypes.c_int] * 4 + [wintypes.UINT]
+
+
+def _no_caption(hwnd, msg, wparam, lparam, _id, _ref):
+    if msg == 0x0083 and wparam:  # WM_NCCALCSIZE: let Windows size the borders, then give the caption to the page
+        rect = ctypes.cast(lparam, ctypes.POINTER(_NCCALCSIZE_PARAMS)).contents.rgrc[0]
+        left, top = rect.left, rect.top
+        result = _comctl32.DefSubclassProc(hwnd, msg, wparam, lparam)
+        # a maximized window hangs one border-width off every screen edge; keep the top of the page on screen
+        rect.top = top + (rect.left - left if _user32.IsZoomed(hwnd) else 0)
+        return result
+    return _comctl32.DefSubclassProc(hwnd, msg, wparam, lparam)
+
+
+_no_caption_proc = _SUBCLASSPROC(_no_caption)  # module-level: Windows calls it for the window's lifetime
+
+
+def enable_drag_regions():
+    """Let CSS `app-region: drag` move the window natively (with snapping and double-click to maximize).
+    pywebview applies its WebView2 settings in on_webview_ready, before the first page loads; add ours there."""
+    try:
+        from webview.platforms import edgechromium
+    except Exception:
+        return  # not Windows / no WebView2: the page simply isn't draggable
+    original = edgechromium.EdgeChrome.on_webview_ready
+
+    def on_webview_ready(self, sender, args):
+        if args.IsSuccess:
+            sender.CoreWebView2.Settings.IsNonClientRegionSupportEnabled = True
+        original(self, sender, args)
+    edgechromium.EdgeChrome.on_webview_ready = on_webview_ready
+
+
+class SetupBar:
+    """Native strip docked across the top while a Google / Twitch setup page shows. The page gets the rest of the
+    window, so nothing on it is covered, and it resizes with the window. It is the title bar there: drag it,
+    double-click it, resize from its top edge. Built from WinForms on the window's own thread."""
+    HOVER = {"dark": (0x2A, 0x23, 0x37), "light": (0xEE, 0xE8, 0xF7)}
+    BORDER = {"dark": (0x4A, 0x41, 0x5E), "light": (0xC9, 0xC0, 0xD8)}
+
+    def __init__(self, app):
+        import System.Drawing as SD
+        import System.Windows.Forms as WF
+        self.SD, self.WF, self.app = SD, WF, app
+        self.form, self.hwnd, self.last_down = app.window.native, app.hwnd(), (0, 0, 0)
+        scale = _user32.GetDpiForWindow(self.hwnd) / 96
+        self.px = px = lambda n: int(round(n * scale))
+        names = {f.Name for f in SD.FontFamily.Families}
+        self.glyphs = SD.Font("Segoe Fluent Icons" if "Segoe Fluent Icons" in names else "Segoe MDL2 Assets", 7.5)
+        self.icon_font = SD.Font(self.glyphs.FontFamily, 9.0)
+
+        self.bar = WF.Panel(); self.bar.Dock = WF.DockStyle.Top; self.bar.Height = px(46); self.bar.Visible = False
+        self.label = WF.Label(); self.label.AutoEllipsis = True
+        self.label.TextAlign = SD.ContentAlignment.MiddleLeft; self.label.Padding = WF.Padding(px(12), 0, px(6), 0)
+        self.label.Font = SD.Font("Segoe UI", 9.75)
+        self.tip = WF.ToolTip()
+        self.accent = WF.Panel(); self.accent.Dock = WF.DockStyle.Bottom; self.accent.Height = px(2)
+        self.accent.Paint += self.paint_accent
+        self.accent.Resize += lambda s, e: self.accent.Invalidate()
+
+        self.close = self.window_button("", "close", "Close")
+        self.max = self.window_button("", "max", "Maximize")
+        self.min = self.window_button("", "min", "Minimize")
+        self.back = self.text_button("◀  Back", lambda: self.app.go_home(), "Back to DualChat")
+        self.external = self.text_button("Open In Browser", self.open_external, "Open this page in your normal browser")
+        self.external.TextImageRelation = WF.TextImageRelation.TextBeforeImage
+        self.actions = (self.external, self.back)  # left to right
+        for c in (self.label, self.close, self.max, self.min) + self.actions + (self.accent,):
+            self.bar.Controls.Add(c)
+        for c in (self.bar, self.label):
+            c.MouseDown += self.on_mouse_down
+            c.MouseMove += self.on_mouse_move
+        self.bar.Resize += lambda s, e: self.layout()
+        self.form.Controls.Add(self.bar)  # behind the page in z-order, so it docks first and the page fills the rest
+        self.form.Resize += lambda s, e: self.update_max()
+
+    def layout(self):
+        """One row when there's room; otherwise the step text (and, narrowest, the action buttons) drop to
+        their own rows. The bar grows to fit and the page below shrinks to match, so nothing overlaps."""
+        SD, px, W, row = self.SD, self.px, self.bar.Width, self.px(44)
+        x = W
+        for b in (self.close, self.max, self.min):  # window buttons: always the top-right corner
+            x -= b.Width
+            b.Location = SD.Point(x, 0)
+        acts = [b for b in self.actions if b.Visible]
+        acts_w = sum(b.Width + px(8) for b in acts)
+        if x - acts_w >= px(260):  # wide: text | actions | window buttons
+            mode, ax, ay = 1, x - acts_w, 0
+        elif x - acts_w >= px(8):  # medium: actions beside the window buttons, text underneath
+            mode, ax, ay = 2, x - acts_w, 0
+        else:  # narrowest: window buttons, then actions on their own row, then text
+            mode, ax, ay = 3, px(12), row
+        for b in acts:
+            b.Location = SD.Point(ax, ay + (row - b.Height) // 2)
+            ax += b.Width + px(8)
+        if mode == 1:
+            self.label.AutoEllipsis = True
+            self.label.Bounds = SD.Rectangle(0, 0, x - acts_w, row)
+            height = row
+        else:
+            top = row * (mode - 1)
+            self.label.AutoEllipsis = False  # wraps onto as many lines as it needs
+            need = self.WF.TextRenderer.MeasureText(self.label.Text or " ", self.label.Font, SD.Size(W - px(18), 0),
+                                                   self.WF.TextFormatFlags.WordBreak).Height
+            self.label.Bounds = SD.Rectangle(0, top, W, need + px(14))
+            height = top + need + px(14)
+        height += self.accent.Height
+        if self.bar.Height != height:
+            self.bar.Height = height
+
+    def window_button(self, glyph, cmd, name):
+        b = self.base_button(glyph, lambda: self.app.window_cmd(cmd), name)
+        b.Font, b.Size, b.Margin = self.glyphs, self.SD.Size(self.px(46), self.px(44)), self.WF.Padding(0)
+        b.FlatAppearance.BorderSize = 0
+        return b
+
+    def text_button(self, text, action, tip):
+        b = self.base_button(text, action, tip)
+        b.Font = self.SD.Font("Segoe UI Semibold", 9.0)
+        b.AutoSize, b.AutoSizeMode = True, self.WF.AutoSizeMode.GrowAndShrink
+        b.Padding, b.Margin = self.WF.Padding(self.px(6), 0, self.px(6), 0), self.WF.Padding(0, self.px(8), self.px(8), self.px(8))
+        return b
+
+    def base_button(self, text, action, tip):
+        b = self.WF.Button()
+        b.Text, b.AccessibleName, b.FlatStyle, b.Cursor = text, tip, self.WF.FlatStyle.Flat, self.WF.Cursors.Hand
+        b.TabStop = False
+        b.Click += lambda s, e: threading.Thread(target=action, daemon=True).start()  # keep the window's thread free
+        self.tip.SetToolTip(b, tip)
+        return b
+
+    def open_external(self):
+        webbrowser.open(self.app.window.get_current_url() or "")
+
+    def paint_accent(self, sender, e):
+        r = sender.ClientRectangle
+        if r.Width > 0 and r.Height > 0:
+            from System.Drawing.Drawing2D import LinearGradientBrush
+            brush = LinearGradientBrush(r, self.SD.Color.FromArgb(0xE6, 0x21, 0x17), self.SD.Color.FromArgb(0x91, 0x46, 0xFF), 0.0)
+            e.Graphics.FillRectangle(brush, r)
+            brush.Dispose()
+
+    def glyph_image(self, glyph, color):
+        """Icons can't share a button's text font, so the Open In Browser icon is drawn into a small image."""
+        from System.Drawing.Text import TextRenderingHint
+        size = self.px(16)
+        bmp = self.SD.Bitmap(size, size)
+        g = self.SD.Graphics.FromImage(bmp)
+        g.TextRenderingHint = TextRenderingHint.AntiAliasGridFit
+        brush = self.SD.SolidBrush(color)
+        g.DrawString(glyph, self.icon_font, brush, self.SD.PointF(0, self.px(1)))
+        brush.Dispose(); g.Dispose()
+        return bmp
+
+    def apply_theme(self, theme):
+        C = lambda rgb: self.SD.Color.FromArgb(*rgb)
+        t = THEMES[theme]
+        hdr, text, hover, border = C(t["hdr"]), C(t["text"]), C(self.HOVER[theme]), C(self.BORDER[theme])
+        for c in (self.bar, self.label):
+            c.BackColor = hdr
+        self.label.ForeColor = text
+        for b in (self.min, self.max, self.close, self.external):
+            b.BackColor, b.ForeColor = hdr, text
+            b.FlatAppearance.MouseOverBackColor = b.FlatAppearance.MouseDownBackColor = hover
+        self.external.FlatAppearance.BorderColor = border
+        self.close.FlatAppearance.MouseOverBackColor = self.close.FlatAppearance.MouseDownBackColor = C((0xE8, 0x11, 0x23))
+        self.back.BackColor, self.back.ForeColor = C((0x91, 0x46, 0xFF)), C((0xFF, 0xFF, 0xFF))
+        self.back.FlatAppearance.BorderSize = 0
+        self.back.FlatAppearance.MouseOverBackColor = self.back.FlatAppearance.MouseDownBackColor = C((0xA2, 0x66, 0xFF))
+        self.external.Image = self.glyph_image("", text)  # "open in new window"
+
+    def show(self, page, text):
+        self.apply_theme(self.app.theme)
+        self.set_text(text)
+        self.update_max()
+        self.bar.Visible = True
+        self.layout()
+
+    def hide(self):
+        self.bar.Visible = False
+
+    def set_text(self, text):
+        if self.label.Text != text:
+            self.label.Text = text
+            self.tip.SetToolTip(self.label, text)  # full text when the window is too narrow for it
+            self.layout()
+
+    def update_max(self):
+        zoomed = bool(_user32.IsZoomed(self.hwnd))
+        self.max.Text = "" if zoomed else ""
+        self.max.AccessibleName = "Restore" if zoomed else "Maximize"
+        self.tip.SetToolTip(self.max, self.max.AccessibleName)
+
+    def on_mouse_move(self, sender, e):
+        top = sender.Top + e.Y if sender is self.label else e.Y
+        edge = top < self.px(4) and not _user32.IsZoomed(self.hwnd)
+        sender.Cursor = self.WF.Cursors.SizeNS if edge else self.WF.Cursors.Default
+
+    def on_mouse_down(self, sender, e):
+        if e.Button != self.WF.MouseButtons.Left:
+            return
+        top = sender.Top + e.Y if sender is self.label else e.Y
+        now, (t0, x0, y0) = time.monotonic(), self.last_down
+        pos = self.WF.Control.MousePosition
+        self.last_down = (now, pos.X, pos.Y)
+        # the move loop below swallows Windows' own double-click detection, so spot double-clicks here
+        if now - t0 < self.WF.SystemInformation.DoubleClickTime / 1000 and abs(pos.X - x0) < 6 and abs(pos.Y - y0) < 6:
+            self.last_down = (0, 0, 0)
+            threading.Thread(target=self.app.window_cmd, args=("max",), daemon=True).start()
+            return
+        _user32.ReleaseCapture()
+        if top < self.px(4) and not _user32.IsZoomed(self.hwnd):
+            _user32.SendMessageW(self.hwnd, 0x0112, 0xF003, 0)  # WM_SYSCOMMAND SC_SIZE + top edge
+        else:
+            _user32.SendMessageW(self.hwnd, 0x00A1, 2, 0)  # WM_NCLBUTTONDOWN on HTCAPTION: Windows moves it, with snapping
+
+
+class Api:
+    """Called from ui.html. Setup pages from Google and Twitch load in this same window and can see these
+    methods too, so every call is refused unless DualChat's own page is the one showing."""
+
+    def __init__(self, app):
+        self._app = app
+
+    def _home(self):
+        return self._app.at_home()
+
+    def hello(self):
+        if self._home():
+            return self._app.hello()
+
+    def poll(self, after=0):
+        if self._home():
+            return self._app.poll(after)
+
+    def send(self, text):
+        if self._home():
+            self._app.send(text)
+
+    def toggle_theme(self):
+        if self._home():
+            self._app.toggle_theme()
+
+    def window_cmd(self, cmd):
+        if self._home() and cmd in ("min", "max", "close"):
+            self._app.window_cmd(cmd)
+
+    def begin_resize(self, edge):
+        if self._home() and edge in RESIZE_EDGES:
+            self._app.begin_resize(edge)
+
+    def open_page(self, key):
+        if self._home() and key in PAGES:
+            self._app.browse(key)
+
+    def open_signin(self, platform):
+        if self._home() and platform in self._app.signins:
+            self._app.browse("signin:" + platform)
+
+    def open_signin_external(self, platform):
+        if self._home() and platform in self._app.signins:
+            webbrowser.open(self._app.signins[platform][0])
+
+    def save_keys(self, platform, vals):
+        if self._home() and platform in OAUTH and isinstance(vals, dict):
+            return self._app.save_keys(platform, vals)
+
+    def finish_setup(self):
+        if self._home():
+            return self._app.finish_setup()
+
+
+class PopupApi:
+    def __init__(self):
+        self._window = None
+
+    def close(self):
+        window, self._window = self._window, None  # closed by click and by timer: only destroy once
+        if window:
+            window.destroy()
+
+    def fit(self, height):
+        if self._window:
+            self._window.resize(POPUP_W, min(int(height), POPUP_SLOT - 10))
 
 
 class App:
-    def __init__(self, services):
-        self.q, self.last = queue.Queue(), None
-        self.alerts, self.popups = queue.Queue(), {}  # popups: window -> stacking slot
-        self.root = tk.Tk()
-        try:
-            self.root.iconbitmap(default=str(ASSETS / "dualchat.ico"))  # default= covers every window
-        except tk.TclError:
-            pass  # icon file missing: keep Tk's default
-        scale = self.root.winfo_fpixels("1i") / 96  # fonts scale with DPI on their own; pixel sizes don't
-        self.px = lambda n: round(n * scale)
-        self.root.title("DualChat")
-        self.root.geometry(f"{self.px(540)}x{self.px(760)}")
-        self.bar = tk.Frame(self.root, padx=self.px(10), pady=self.px(10))
-        self.bar.pack(side="bottom", fill="x")
-        self.entry = tk.Entry(self.bar, font=("Segoe UI", 12), relief="flat", highlightthickness=self.px(2),
-                              highlightcolor="#9146ff")
-        self.entry.pack(fill="x", ipady=self.px(6))
-        self.top = tk.Frame(self.root)
-        self.top.pack(side="top", fill="x")
-        self.toggle = tk.Button(self.top, font=("Segoe UI", 10), relief="flat", borderwidth=0, cursor="hand2",
-                                padx=self.px(10), pady=self.px(3), command=self.flip_theme)
-        self.toggle.pack(side="right", padx=self.px(10))
-        self.counts = tk.Label(self.top, anchor="w", font=("Segoe UI Semibold", 11),
-                               padx=self.px(12), pady=self.px(8))
-        self.counts.pack(side="left", fill="x", expand=True)
-        self.log = scrolledtext.ScrolledText(self.root, state="disabled", wrap="word", relief="flat", borderwidth=0,
-                                             font=("Segoe UI", 11), padx=self.px(12), pady=self.px(10),
-                                             spacing1=self.px(3), spacing3=self.px(3), highlightthickness=0)
-        self.log.pack(fill="both", expand=True)
-        self.log.tag_config("alert", font=("Segoe UI", 11, "bold"))
-        self.emoji_px = round(tkfont.Font(root=self.root, font=("Segoe UI", 11)).metrics("linespace") * 0.85)
-        self.emoji_img = {}  # sequence -> PhotoImage; Tk drops images nobody holds a reference to
+    def __init__(self, config_note=None):
+        self.events, self.seq, self.lock = collections.deque(maxlen=800), 0, threading.Lock()
+        self.services, self.started, self.last = [], set(), None
+        self.signins, self.popups = {}, {}  # platform -> (url, code); popup window -> stacking slot
+        self.mode, self.page, self.origin, self.home_url, self._bar = "home", None, None, None, None
         self.theme = CFG.get("theme") if CFG.get("theme") in THEMES else "dark"
-        self.apply_theme()
-        self.entry.bind("<Return>", self.submit)
-        self.entry.focus_set()
-        self.services = [cls(self) for cls in services]
-        for s in self.services:
-            threading.Thread(target=s.run, daemon=True).start()
-        self.root.after(100, self.pump)
+        self.config_note = config_note
+        global DEVICE_PROMPT, DEVICE_DONE
+        DEVICE_PROMPT, DEVICE_DONE = self.device_prompt, self.device_done
+        self.window = webview.create_window(
+            "DualChat", url=str(ASSETS / "ui.html"), js_api=Api(self), width=560, height=780, min_size=(420, 520),
+            background_color=hex_color(THEMES[self.theme]["hdr"]))
+        self.window.events.loaded += self.on_loaded
+        self.window.events.shown += self.on_shown
 
-    def apply_theme(self):
-        t = THEMES[self.theme]
-        for w in (self.root, self.bar, self.top):
-            w.configure(bg=t["bg"])
-        self.counts.configure(bg=t["bg"], fg=t["text"])
-        self.toggle.configure(text="☀  Light" if self.theme == "dark" else "☾  Dark",  # names the mode you switch to
-                              bg=t["field"], fg=t["text"], activebackground=t["border"], activeforeground=t["text"])
-        self.entry.configure(bg=t["field"], fg=t["text"], insertbackground=t["text"],
-                             highlightbackground=t["border"], selectbackground=t["select"], selectforeground=t["text"])
-        self.log.configure(bg=t["panel"], fg=t["text"], selectbackground=t["select"], selectforeground=t["text"])
-        for tag in ("YT", "TW", "sys", "alert"):
-            self.log.tag_config(tag, foreground=t[tag])
+    def run(self):
+        enable_drag_regions()
+        storage = Path(os.environ.get("LOCALAPPDATA", HERE)) / "DualChat" / "webview"  # setup-page sign-ins
+        webview.start(http_server=True, private_mode=False, storage_path=str(storage),
+                      icon=str(ASSETS / "dualchat.ico"))
 
-    def flip_theme(self):
-        self.theme = "light" if self.theme == "dark" else "dark"
-        self.apply_theme()
-        CFG["theme"] = self.theme
-        try:  # remember it for next launch
-            (HERE / "config.json").write_text(json.dumps(CFG, indent=2), encoding="utf-8")
-        except OSError as e:
-            self.status(f"Couldn't save theme: {e}")
+    def on_shown(self):
+        self.paint_title_bar()
+        self.strip_title_bar()
 
-    # add/status are called from worker threads; only pump touches the widgets
-    def add(self, tag, user, text):
-        fetch_emoji(user + text)
-        self.q.put((tag, f"[{tag}] {user}: ", text))
+    def hwnd(self):
+        return int(self.window.native.Handle.ToInt64())
 
-    def status(self, msg):
-        if msg != self.last:  # don't repeat the same "waiting..." line
-            self.last = msg
-            self.q.put(("sys", "", msg))
+    def on_ui(self, fn):
+        """Run fn on the window's own thread (Windows only lets that thread hook or size the window)."""
+        from System import Action
+        self.window.native.BeginInvoke(Action(fn))
 
-    def alert(self, tag, title, body=""):
-        fetch_emoji(title + body)
-        self.alerts.put((tag, title, body))
-        self.q.put((tag, f"[{tag}] ★ ", title + (f"  {body}" if body else "")))
+    def strip_title_bar(self):
+        if sys.platform != "win32":
+            return
+        hwnd = self.hwnd()
 
-    def popup(self, tag, title, body):
-        w = tk.Toplevel(self.root)
-        w.overrideredirect(True)  # no title bar
-        w.attributes("-topmost", True)  # stay above the game/OBS
-        px = self.px
-        tk.Label(w, text=title, bg={"YT": "#cc0000", "TW": "#9146ff"}[tag], fg="white", font=("Segoe UI Semibold", 14),
-                 wraplength=px(380), justify="left", anchor="w", padx=px(16), pady=px(12)).pack(fill="x")
-        if body:
-            t = THEMES[self.theme]
-            tk.Label(w, text=body, bg=t["panel"], fg=t["text"], font=("Segoe UI", 11),
-                     wraplength=px(380), justify="left", anchor="w", padx=px(16), pady=px(10)).pack(fill="x")
-        slot = min(set(range(len(self.popups) + 1)) - set(self.popups.values()))
-        self.popups[w] = slot
-        w.geometry(f"+{w.winfo_screenwidth() - px(440)}+{px(40) + slot * px(150)}")
+        def apply():
+            _comctl32.SetWindowSubclass(hwnd, _no_caption_proc, 1, 0)
+            _user32.SetWindowPos(hwnd, None, 0, 0, 0, 0, 0x37)  # NOSIZE|NOMOVE|NOZORDER|NOACTIVATE|FRAMECHANGED
+        self.on_ui(apply)
 
-        def close(_event=None):
-            self.popups.pop(w, None)
-            w.destroy()
-        w.bind("<Button-1>", close)  # click to dismiss early
-        w.after(POPUP_MS, close)
+    def window_cmd(self, cmd):
+        if cmd == "close":
+            self.window.destroy()
+        elif cmd == "min":
+            self.window.minimize()
+        elif self.maximized():
+            self.window.restore()
+        else:
+            self.window.maximize()
 
-    def pump(self):
-        self.counts.configure(text=viewer_line([(s.tag, s.viewers) for s in self.services]))
-        while not self.alerts.empty():
-            self.popup(*self.alerts.get())
-        if not self.q.empty():
-            at_bottom = self.log.yview()[1] >= 0.999
-            self.log.configure(state="normal")
-            while not self.q.empty():
-                tag, head, body = self.q.get()
-                self.insert_rich(head, tag)
-                self.insert_rich(body + "\n", "sys" if tag == "sys" else "alert" if "★" in head else ())
-            self.log.configure(state="disabled")
-            if at_bottom:
-                self.log.see("end")
-        self.root.after(100, self.pump)
+    def maximized(self):
+        try:
+            return bool(_user32.IsZoomed(self.hwnd()))
+        except Exception:
+            return False
 
-    def insert_rich(self, text, style):
-        """Insert text into the log with each emoji as an inline color image."""
-        pos = 0
-        for m in EMOJI_RE.finditer(text):
-            img = self.emoji(m.group())
-            if img:
-                self.log.insert("end", text[pos:m.start()], style)
-                self.log.image_create("end", image=img, align="center", padx=self.px(1))
-                pos = m.end()
-        self.log.insert("end", text[pos:], style)
+    def begin_resize(self, edge):
+        """The page covers the old caption, so the top edge resizes through here: hand the drag to Windows."""
+        hwnd = self.hwnd()
+        self.on_ui(lambda: (_user32.ReleaseCapture(),
+                            _user32.SendMessageW(hwnd, 0x0112, 0xF000 + RESIZE_EDGES[edge], 0)))  # WM_SYSCOMMAND SC_SIZE
 
-    def emoji(self, seq):
-        if seq not in self.emoji_img:
-            if not _emoji_png.get(seq):
-                return None  # not downloaded (yet): plain character this time
-            im = Image.open(io.BytesIO(_emoji_png[seq])).convert("RGBA")
-            self.emoji_img[seq] = ImageTk.PhotoImage(
-                im.resize((self.emoji_px, self.emoji_px), Image.Resampling.LANCZOS), master=self.root)
-        return self.emoji_img[seq]
+    # -- the window's own page vs. setup pages --
 
-    def submit(self, _event):
-        text = clean(self.entry.get())
+    def on_loaded(self):
+        url = self.window.get_current_url() or ""
+        if self.origin is None and url.startswith("http://127.0.0.1"):
+            self.home_url = url
+            self.origin = "/".join(url.split("/")[:3]) + "/"  # http://127.0.0.1:<port>/
+            if self.config_note:
+                self.status(self.config_note)
+            self.start_services()
+
+    def at_home(self):
+        url = self.window.get_current_url() or ""
+        return bool(self.origin) and url.startswith(self.origin)
+
+    def browse(self, page):
+        self.mode, self.page = "browse", page
+        url = self.signins[page.split(":")[1]][0] if page.startswith("signin:") else PAGES[page][0]
+        text = self.bar_text(page)
+        self.on_ui(lambda: self.setup_bar().show(page, text))
+        self.window.load_url(url)
+        threading.Thread(target=self.watch_page, daemon=True).start()
+
+    def go_home(self):
+        self.mode, self.page = "home", None
+        self.on_ui(lambda: self._bar and self._bar.hide())
+        self.window.load_url(self.home_url)
+
+    def setup_bar(self):
+        """Created on first use, on the window's thread."""
+        if self._bar is None:
+            self._bar = SetupBar(self)
+        return self._bar
+
+    def watch_page(self):
+        """While a setup page shows: keep the bar's text current, fill in sign-in codes, capture keys."""
+        page, filled, left, shown = self.page, False, False, None
+        while self.mode == "browse" and self.page == page:
+            try:
+                url = self.window.get_current_url() or ""
+                if self.at_home():
+                    if left:  # the page itself navigated back to DualChat
+                        self.mode = "home"
+                        self.on_ui(lambda: self._bar and self._bar.hide())
+                        return
+                    time.sleep(0.2)  # setup page hasn't started loading yet
+                    continue
+                left = True
+                if page == "signin:youtube" and not filled and "google" in url:
+                    filled = bool(self.window.evaluate_js(f"{FILL_CODE_JS}({json.dumps(self.signins.get('youtube', ('', ''))[1])})"))
+                self.capture(url)
+                text = self.bar_text(page)
+                if text != shown:
+                    shown = text
+                    self.on_ui(lambda t=text: self._bar and self._bar.set_text(t))
+            except Exception:
+                pass  # page is mid-navigation; try again next tick
+            time.sleep(1)
+
+    def capture(self, url):
+        if "console.cloud.google.com" in url:
+            found = capture_google(self.window.evaluate_js("document.body ? document.body.innerText : ''") or "")
+            if found and (CFG.get("youtube", {}).get("client_id"), CFG.get("youtube", {}).get("client_secret")) != found:
+                CFG.setdefault("youtube", {}).update(client_id=found[0], client_secret=found[1])
+                save_config()
+                self.status("YouTube keys captured and saved.")
+        tid = capture_twitch(url)
+        if tid and CFG.get("twitch", {}).get("client_id") != tid:
+            CFG.setdefault("twitch", {}).update(client_id=tid)
+            CFG["twitch"].setdefault("channel", "")
+            save_config()
+            self.status("Twitch Client ID captured and saved.")
+
+    def bar_text(self, page):
+        if page.startswith("signin:"):
+            name = page.split(":")[1]
+            return (f"Sign in to {'YouTube' if name == 'youtube' else 'Twitch'}, then approve DualChat.   "
+                    f"Code: {self.signins.get(name, ('', ''))[1]}")
+        platform = "twitch" if "twitch" in page else "youtube"
+        got = f"   ✓ {dict(youtube='YouTube', twitch='Twitch')[platform]} keys saved" if is_ready(platform) else ""
+        return PAGES[page][1] + got
+
+    # -- ui.html calls these (through Api) --
+
+    def hello(self):
+        with self.lock:
+            return {"view": "chat" if self.started or any(map(is_ready, OAUTH)) else "setup",
+                    "events": [e for _, e in self.events], "seq": self.seq}
+
+    def poll(self, after):
+        with self.lock:
+            new = [e for s, e in self.events if s > after]
+            seq = self.seq
+        return {"events": new, "seq": seq, "state": self.state()}
+
+    def state(self):
+        running = {s.tag: s for s in self.services}
+        platforms = [{"tag": tag, "viewers": running[tag].viewers if tag in running else None,
+                      "connected": tag in running and bool(getattr(running[tag], "online", None)
+                                                           or getattr(running[tag], "chat_id", None))}
+                     for name, tag in (("youtube", "YT"), ("twitch", "TW")) if is_ready(name) or tag in running]
+        return {"theme": self.theme, "running": bool(self.services), "platforms": platforms,
+                "maximized": self.maximized(),
+                "keys": {"youtube": {"ready": is_ready("youtube"), "client_id": key("youtube", "client_id"),
+                                     "has_secret": bool(key("youtube", "client_secret"))},  # the secret never goes to the page
+                         "twitch": {"ready": is_ready("twitch"), "client_id": key("twitch", "client_id"),
+                                    "channel": key("twitch", "channel")}}}
+
+    def save_keys(self, platform, vals):
+        keys, error = check_keys(platform, vals)
+        if error:
+            return {"ok": False, "error": error}
+        CFG.setdefault(platform, {}).update(keys)
+        save_config()
+        return {"ok": True}
+
+    def finish_setup(self):
+        if not any(map(is_ready, OAUTH)):
+            return {"ok": False}
+        self.start_services()
+        return {"ok": True}
+
+    def start_services(self):
+        for name, cls in (("youtube", YouTube), ("twitch", Twitch)):
+            if is_ready(name) and name not in self.started:
+                self.started.add(name)
+                s = cls(self)
+                self.services.append(s)
+                threading.Thread(target=s.run, daemon=True).start()
+
+    def send(self, text):
+        text = clean(text)
         if not text:
             return
         if len(text) > MAX_LEN:
             return self.status(f"Too long: {len(text)}/{MAX_LEN} characters (YouTube's limit)")
-        self.entry.delete(0, "end")
         for s in self.services:
             threading.Thread(target=self.deliver, args=(s, text), daemon=True).start()
 
@@ -589,28 +1001,100 @@ class App:
         except Exception as e:
             self.status(f"{service.tag}: send failed ({e})")
 
+    def toggle_theme(self):
+        self.theme = "light" if self.theme == "dark" else "dark"
+        CFG["theme"] = self.theme
+        try:  # remember it for next launch
+            save_config()
+        except OSError as e:
+            self.status(f"Couldn't save theme: {e}")
+        self.paint_title_bar()
 
-def fail(msg):
-    """The .exe has no console, so startup problems go in a dialog box."""
-    messagebox.showerror("DualChat", msg)
-    raise SystemExit(msg)
+    def paint_title_bar(self):
+        """Color the Windows title bar to match the header (Windows 11; older Windows ignores it).
+        Returns the DWM result codes, 0 meaning applied."""
+        try:
+            hwnd = int(self.window.native.Handle.ToInt64())
+            t = THEMES[self.theme]
+            codes = []
+            for attr, value in ((20, int(self.theme == "dark")),  # dark title-bar buttons
+                                (35, t["hdr"][0] | t["hdr"][1] << 8 | t["hdr"][2] << 16),  # caption
+                                (34, t["hdr"][0] | t["hdr"][1] << 8 | t["hdr"][2] << 16),  # border
+                                (36, t["text"][0] | t["text"][1] << 8 | t["text"][2] << 16)):  # title text
+                v = ctypes.c_uint(value)
+                codes.append(ctypes.windll.dwmapi.DwmSetWindowAttribute(hwnd, attr, ctypes.byref(v), 4))
+            return codes
+        except Exception:
+            return None
+
+    # -- services and sign-in call these from worker threads --
+
+    def push(self, event):
+        with self.lock:
+            self.seq += 1
+            self.events.append((self.seq, event))
+
+    def add(self, tag, user, text):
+        self.push({"type": "msg", "tag": tag, "user": user, "text": text})
+
+    def status(self, msg):
+        if msg != self.last:  # don't repeat the same "waiting..." line
+            self.last = msg
+            self.push({"type": "status", "text": msg})
+
+    def alert(self, tag, title, body=""):
+        self.push({"type": "alert", "tag": tag, "title": title, "body": body})
+        threading.Thread(target=self.popup, args=(tag, title, body), daemon=True).start()
+
+    def device_prompt(self, name, url, code):
+        self.signins[name] = (url, code)
+        self.push({"type": "signin", "platform": name, "code": code})
+
+    def device_done(self, name):
+        self.signins.pop(name, None)
+        self.push({"type": "signedin", "platform": name})
+        if self.page == "signin:" + name:
+            self.go_home()
+
+    def popup(self, tag, title, body):
+        """Always-on-top alert in the top-right corner for POPUP_MS; click to close early."""
+        api = PopupApi()
+        with self.lock:
+            slot = min(set(range(len(self.popups) + 1)) - set(self.popups.values()))
+            self.popups[api] = slot
+        t = THEMES[self.theme]
+        page = (f'<body style="margin:0;cursor:pointer;font-family:Segoe UI,sans-serif;background:{t["panel"]};overflow:hidden" '
+                f'onclick="pywebview.api.close()"><div style="background:{"#CC0000" if tag == "YT" else "#9146FF"};'
+                f'color:#fff;padding:12px 16px;font-weight:600;font-size:17px">{html.escape(title)}</div>'
+                + (f'<div style="color:{t["fg"]};padding:10px 16px;font-size:14px">{html.escape(body)}</div>' if body else "")
+                + '<script>window.addEventListener("pywebviewready",()=>pywebview.api.fit(document.body.scrollHeight))</script></body>')
+        screen = webview.screens[0]
+        api._window = webview.create_window(
+            "DualChat alert", html=page, js_api=api, width=POPUP_W, height=POPUP_SLOT - 10,
+            x=screen.width - POPUP_W - 20, y=20 + slot * POPUP_SLOT, frameless=True, on_top=True, focus=False,
+            resizable=False, background_color=t["panel"])
+        time.sleep(POPUP_MS / 1000)
+        api.close()
+        with self.lock:
+            self.popups.pop(api, None)
+
+
+def load_config():
+    """-> a note for the chat if config.json couldn't be read (it's set aside, never overwritten)."""
+    if not CONFIG.exists():
+        return None
+    try:
+        CFG.update(json.loads(CONFIG.read_text(encoding="utf-8-sig")))  # -sig: some editors add a BOM
+    except ValueError as e:
+        kept = CONFIG.with_name(f"config.broken-{int(time.time())}.json")
+        os.replace(CONFIG, kept)
+        return f"config.json couldn't be read ({e}), so it was renamed to {kept.name}. Set up your keys again."
+    return None
 
 
 def main():
     windows_setup()
-    path = HERE / "config.json"
-    if not path.exists():
-        fail(f"No config.json found in\n{HERE}\n\nCopy config.example.json to config.json and fill in "
-             "your client IDs (README.md has the steps).")
-    try:
-        CFG.update(json.loads(path.read_text(encoding="utf-8-sig")))  # -sig: some editors add a BOM
-    except ValueError as e:
-        fail(f"config.json isn't valid JSON:\n{e}")
-    services = [cls for name, cls in (("youtube", YouTube), ("twitch", Twitch))
-                if not CFG.get(name, {}).get("client_id", "YOUR_").startswith("YOUR_")]
-    if not services:
-        fail("No platform set up in config.json yet (README.md has the steps).")
-    App(services).root.mainloop()
+    App(load_config()).run()
 
 
 def windows_setup():

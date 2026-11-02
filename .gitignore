@@ -1,4 +1,6 @@
 config.json
+config.tmp
+config.broken-*.json
 tokens.json
 __pycache__/
 build/

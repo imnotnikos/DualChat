@@ -1,0 +1,342 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<title>DualChat</title>
+<style>
+  /* Windows' emoji font has no country flags (they show as letters); this one fills in only those */
+  @font-face { font-family: "Twemoji Country Flags"; src: url("assets/TwemojiCountryFlags.woff2") format("woff2");
+               unicode-range: U+1F1E6-1F1FF, U+1F3F4, U+E0062-E007F; }
+  :root, [data-theme="dark"] {
+    --hdr: #1A1424; --bg: #0F0D14; --panel: #16131D; --field: #221D2C; --text: #EFEAF7; --muted: #8E86A0;
+    --border: #2E2840; --hover: #2A2337; --yt: #FF6B6B; --tw: #B98CFF; --alert: #FFD75E; --alert-bg: #2A2215;
+    --ok: #3DDC84; --off: #5A536B; --accent: linear-gradient(90deg, #E62117, #9146FF);
+    --thumb: #3A3249; --thumb-hover: #54496A; color-scheme: dark;
+  }
+  [data-theme="light"] {
+    --hdr: #F3EEFB; --bg: #FAF8FD; --panel: #FFFFFF; --field: #FFFFFF; --text: #1B1724; --muted: #6D6680;
+    --border: #DDD5EA; --hover: #EEE8F7; --yt: #C4170C; --tw: #6A2FD8; --alert: #8A5200; --alert-bg: #FFF4D6;
+    --ok: #1E9E57; --off: #B7AFC6;
+    --thumb: #D3CBE0; --thumb-hover: #B9AECB; color-scheme: light;
+  }
+  /* themed scrollbars instead of Windows' white and grey */
+  ::-webkit-scrollbar { width: 12px; height: 12px; }
+  ::-webkit-scrollbar-track, ::-webkit-scrollbar-corner { background: transparent; }
+  ::-webkit-scrollbar-thumb { background: var(--thumb); border-radius: 8px; border: 3px solid transparent; background-clip: padding-box; }
+  ::-webkit-scrollbar-thumb:hover { background-color: var(--thumb-hover); }
+  ::-webkit-scrollbar-button { display: none; }
+  * { box-sizing: border-box; }
+  html, body { margin: 0; height: 100%; }
+  body { background: var(--bg); color: var(--text); font: 15px/1.45 "Twemoji Country Flags", "Segoe UI", system-ui, sans-serif;
+         display: flex; flex-direction: column; overflow: hidden; user-select: none; }
+  button { font: inherit; color: inherit; cursor: pointer; }
+  input { font: inherit; }
+  :focus-visible { outline: 2px solid var(--tw); outline-offset: 2px; }
+
+  /* header is the title bar: drag it to move (native snapping), double-click to maximize */
+  header { background: var(--hdr); display: flex; align-items: center; gap: 10px; padding: 0 0 2px 12px; height: 48px;
+           position: relative; flex: none; app-region: drag; }
+  header button { app-region: no-drag; }
+  .win { display: flex; align-self: stretch; margin-left: 2px; }
+  .win button { width: 46px; border: 0; background: transparent; color: var(--text); display: grid; place-items: center; }
+  .win button:hover { background: var(--hover); }
+  .win button.close:hover { background: #E81123; color: #fff; }
+  .win svg { width: 10px; height: 10px; stroke: currentColor; stroke-width: 1; fill: none; }
+  /* the page covers the old caption, so the top edge's resize handle lives here; sides and bottom are native */
+  #grip { position: fixed; top: 0; left: 0; right: 0; height: 4px; z-index: 10; app-region: no-drag; cursor: ns-resize; }
+  #grip [data-edge="topleft"], #grip [data-edge="topright"] { position: absolute; top: 0; width: 12px; height: 4px; }
+  #grip [data-edge="topleft"] { left: 0; cursor: nwse-resize; }
+  #grip [data-edge="topright"] { right: 0; cursor: nesw-resize; }
+  body.max #grip { display: none; }
+  header::after { content: ""; position: absolute; left: 0; right: 0; bottom: 0; height: 2px; background: var(--accent); }
+  .chips { display: flex; gap: 6px; flex: 1; min-width: 0; overflow: hidden; }
+  @media (max-width: 520px) { .icon-btn .lbl { display: none; } }  /* narrow window: icons only */
+  .chip { display: inline-flex; align-items: center; gap: 6px; padding: 3px 10px; border-radius: 999px;
+          background: var(--field); border: 1px solid var(--border); font-size: 13px; font-weight: 600; white-space: nowrap; }
+  .dot { width: 8px; height: 8px; border-radius: 50%; background: var(--off); }
+  .dot.on { background: var(--ok); }
+  .chip .yt { color: var(--yt); } .chip .tw { color: var(--tw); }
+  .icon-btn { background: var(--field); border: 1px solid var(--border); border-radius: 8px; padding: 4px 10px; font-size: 13px; }
+  .icon-btn:hover { background: var(--hover); }
+
+  .view { display: none; flex: 1; min-height: 0; flex-direction: column; }
+  .view.active { display: flex; }
+
+  /* chat */
+  #log { flex: 1; overflow-y: auto; padding: 10px 14px; background: var(--panel); user-select: text; }
+  .row { padding: 3px 0; overflow-wrap: anywhere; }
+  .badge { display: inline-block; font-size: 10.5px; font-weight: 700; padding: 1px 6px; border-radius: 4px;
+           margin-right: 6px; vertical-align: 1px; color: #fff; }
+  .badge.YT { background: #E62117; } .badge.TW { background: #9146FF; }
+  .name { font-weight: 700; margin-right: 4px; }
+  .name.YT { color: var(--yt); } .name.TW { color: var(--tw); }
+  .sys { color: var(--muted); font-size: 13px; }
+  .alert { background: var(--alert-bg); color: var(--alert); font-weight: 700; border-radius: 8px; padding: 6px 10px; margin: 4px 0; }
+  .alert .body { font-weight: 400; color: var(--text); }
+
+  #signins { background: var(--panel); }
+  .signin { margin: 10px 14px 0; padding: 12px 14px; border-radius: 10px; border: 1px solid var(--border); background: var(--field);
+            display: flex; align-items: center; gap: 12px; flex-wrap: wrap; }
+  .signin .code { font: 700 20px/1 Consolas, monospace; letter-spacing: 2px; user-select: text; }
+  .signin .what { flex: 1; min-width: 160px; }
+  .btn { border: 0; border-radius: 8px; padding: 7px 14px; font-weight: 600; background: #9146FF; color: #fff; }
+  .btn.yt { background: #E62117; }
+  .btn.ghost { background: transparent; color: var(--text); border: 1px solid var(--border); }
+  .btn:hover { filter: brightness(1.1); }
+  .btn:disabled { opacity: .45; cursor: default; filter: none; }
+
+  footer { flex: none; display: flex; gap: 8px; padding: 10px 12px; background: var(--bg); align-items: center; }
+  #msg { flex: 1; background: var(--field); color: var(--text); border: 2px solid var(--border); border-radius: 10px;
+         padding: 9px 12px; outline: none; }
+  #msg:focus { border-color: #9146FF; }
+  #count { font-size: 12px; color: var(--muted); min-width: 52px; text-align: right; }
+  #count.over { color: var(--yt); font-weight: 700; }
+
+  /* setup */
+  #setup { overflow-y: auto; padding: 18px 18px 28px; }
+  #setup h2 { margin: 0 0 4px; font-size: 20px; }
+  #setup .lead { color: var(--muted); margin: 0 0 16px; }
+  .card { background: var(--panel); border: 1px solid var(--border); border-radius: 12px; padding: 14px 16px; margin-bottom: 14px; }
+  .card h3 { margin: 0; font-size: 16px; display: flex; align-items: center; gap: 8px; }
+  .state { margin-left: auto; font-size: 12.5px; font-weight: 700; padding: 2px 10px; border-radius: 999px; background: var(--field); color: var(--muted); }
+  .state.done { color: var(--ok); }
+  ol.steps { margin: 10px 0 6px; padding-left: 22px; }
+  ol.steps li { margin: 7px 0; }
+  ol.steps li .go { margin-left: 8px; font-size: 12.5px; padding: 3px 10px; }
+  .hint { color: var(--muted); font-size: 13px; }
+  .keys { display: grid; grid-template-columns: 120px 1fr; gap: 8px 10px; align-items: center; margin-top: 10px; }
+  .keys input { background: var(--field); color: var(--text); border: 1px solid var(--border); border-radius: 8px; padding: 6px 10px; width: 100%; user-select: text; }
+  .row-btns { display: flex; gap: 8px; margin-top: 10px; flex-wrap: wrap; align-items: center; }
+  .err { color: var(--yt); font-size: 13px; }
+  .done-bar { display: flex; justify-content: flex-end; gap: 10px; }
+</style>
+</head>
+<body data-theme="dark">
+<header>
+  <div class="chips" id="chips"></div>
+  <button class="icon-btn" id="setupBtn" title="Connect accounts"><span class="ico">⚙</span><span class="lbl"> Setup</span></button>
+  <button class="icon-btn" id="themeBtn" title="Switch light / dark"><span class="ico"></span><span class="lbl"></span></button>
+  <div class="win">
+    <button id="minBtn" aria-label="Minimize" title="Minimize"><svg viewBox="0 0 10 10"><path d="M0 5.5h10"/></svg></button>
+    <button id="maxBtn" aria-label="Maximize" title="Maximize"><svg viewBox="0 0 10 10"><rect x=".5" y=".5" width="9" height="9"/></svg></button>
+    <button id="closeBtn" class="close" aria-label="Close" title="Close"><svg viewBox="0 0 10 10"><path d="M.5.5l9 9M9.5.5l-9 9"/></svg></button>
+  </div>
+</header>
+<div id="grip" data-edge="top"><div data-edge="topleft"></div><div data-edge="topright"></div></div>
+
+<section class="view" id="chatView">
+  <div id="signins"></div>
+  <div id="log" aria-live="polite"></div>
+  <footer>
+    <input id="msg" maxlength="400" placeholder="Message YouTube and Twitch…" autocomplete="off" aria-label="Message">
+    <span id="count">0/200</span>
+    <button class="btn" id="sendBtn">Send</button>
+  </footer>
+</section>
+
+<section class="view" id="setupView">
+  <div id="setup">
+    <h2>Connect your accounts</h2>
+    <p class="lead">Each step opens the right page right here in DualChat. Your keys are captured automatically and saved only on this PC.</p>
+
+    <div class="card" id="ytCard">
+      <h3><span class="badge YT">YT</span>YouTube <span class="state" id="ytState"></span></h3>
+      <ol class="steps">
+        <li>Sign in to Google Cloud and create a project<button class="btn ghost go" data-page="google_project">Open</button></li>
+        <li>Turn on <b>YouTube Data API v3</b><button class="btn ghost go" data-page="google_api">Open</button></li>
+        <li>Set up <b>Google Auth Platform</b>: any app name, your email, audience <b>External</b><button class="btn ghost go" data-page="google_auth">Open</button></li>
+        <li>Add your channel's Google account under <b>Test users</b><button class="btn ghost go" data-page="google_audience">Open</button></li>
+        <li>Create a client of type <b>TVs and Limited Input devices</b>. DualChat grabs the keys for you.<button class="btn ghost go" data-page="google_client">Open</button></li>
+      </ol>
+      <div class="hint">Already have keys? Paste them here instead.</div>
+      <div class="keys">
+        <label for="ytId">Client ID</label><input id="ytId" spellcheck="false" placeholder="…apps.googleusercontent.com">
+        <label for="ytSecret">Client secret</label><input id="ytSecret" type="password" spellcheck="false" placeholder="GOCSPX-…">
+      </div>
+      <div class="row-btns"><button class="btn yt" data-save="youtube">Save YouTube keys</button><span class="err" id="ytErr"></span></div>
+    </div>
+
+    <div class="card" id="twCard">
+      <h3><span class="badge TW">TW</span>Twitch <span class="state" id="twState"></span></h3>
+      <ol class="steps">
+        <li>Twitch needs <b>two-factor authentication</b> on your account to register apps<button class="btn ghost go" data-page="twitch_security">Open</button></li>
+        <li>Register an app: any unique name, redirect URL <b>http://localhost</b>, category <b>Chat Bot</b>, client type <b>Public</b>, then <b>Create</b><button class="btn ghost go" data-page="twitch_register">Open</button></li>
+        <li>Click <b>Manage</b> on your app. DualChat grabs the Client ID for you.<button class="btn ghost go" data-page="twitch_apps">Open</button></li>
+      </ol>
+      <div class="keys">
+        <label for="twId">Client ID</label><input id="twId" spellcheck="false" placeholder="30 letters and numbers">
+        <label for="twChan">Channel</label><input id="twChan" spellcheck="false" placeholder="Leave empty for your own channel">
+      </div>
+      <div class="row-btns"><button class="btn" data-save="twitch">Save Twitch keys</button><span class="err" id="twErr"></span></div>
+    </div>
+
+    <div class="done-bar">
+      <button class="btn" id="setupDone">Go to chat</button>
+    </div>
+  </div>
+</section>
+
+<script>
+const $ = s => document.querySelector(s);
+const api = () => window.pywebview.api;
+const MAX = 200;
+let ready = false;
+
+function show(view) {
+  for (const v of document.querySelectorAll('.view')) v.classList.toggle('active', v.id === view + 'View');
+  if (view === 'chat') $('#msg').focus();
+}
+
+function atBottom(el) { return el.scrollHeight - el.scrollTop - el.clientHeight < 40; }
+
+function row(cls) {
+  const log = $('#log'), stick = atBottom(log), div = document.createElement('div');
+  div.className = 'row ' + (cls || '');
+  log.appendChild(div);
+  while (log.children.length > 1500) log.firstChild.remove();
+  if (stick) requestAnimationFrame(() => log.scrollTop = log.scrollHeight);
+  return div;
+}
+
+// chat text is untrusted: only ever set through textContent
+function addMessage(e) {
+  const r = row(), badge = document.createElement('span'), name = document.createElement('span');
+  badge.className = 'badge ' + e.tag; badge.textContent = e.tag;
+  name.className = 'name ' + e.tag; name.textContent = e.user + ':';
+  r.append(badge, name, document.createTextNode(' ' + e.text));
+}
+function addStatus(e) { row('sys').textContent = e.text; }
+function addAlert(e) {
+  const r = row('alert'), badge = document.createElement('span');
+  badge.className = 'badge ' + e.tag; badge.textContent = e.tag;
+  r.append(badge, document.createTextNode('★ ' + e.title));
+  if (e.body) { const b = document.createElement('span'); b.className = 'body'; b.textContent = '  ' + e.body; r.append(b); }
+}
+
+function addSignin(e) {
+  let card = document.getElementById('signin-' + e.platform);
+  if (!card) { card = document.createElement('div'); card.id = 'signin-' + e.platform; card.className = 'signin'; $('#signins').append(card); }
+  card.replaceChildren();
+  const what = document.createElement('div'), code = document.createElement('div'),
+        here = document.createElement('button'), ext = document.createElement('button');
+  what.className = 'what'; what.textContent = 'Sign in to ' + (e.platform === 'youtube' ? 'YouTube' : 'Twitch') + ' with this code:';
+  code.className = 'code'; code.textContent = e.code;
+  here.className = 'btn' + (e.platform === 'youtube' ? ' yt' : ''); here.textContent = 'Sign in here';
+  here.onclick = () => api().open_signin(e.platform);
+  ext.className = 'btn ghost'; ext.textContent = 'Use my browser';
+  ext.onclick = () => api().open_signin_external(e.platform);
+  card.append(what, code, here, ext);
+}
+
+const MAX_ICON = '<rect x=".5" y=".5" width="9" height="9"/>';
+const RESTORE_ICON = '<rect x=".5" y="2.5" width="7" height="7"/><path d="M2.5 2.5V.5h7v7h-2"/>';
+
+function renderState(s) {
+  document.body.dataset.theme = s.theme;
+  if (document.body.classList.contains('max') !== s.maximized || !$('#maxBtn').dataset.set) {
+    document.body.classList.toggle('max', s.maximized);
+    $('#maxBtn svg').innerHTML = s.maximized ? RESTORE_ICON : MAX_ICON;
+    $('#maxBtn').title = $('#maxBtn').ariaLabel = s.maximized ? 'Restore' : 'Maximize';
+    $('#maxBtn').dataset.set = '1';
+  }
+  $('#themeBtn .ico').textContent = s.theme === 'dark' ? '☀' : '☾';
+  $('#themeBtn .lbl').textContent = s.theme === 'dark' ? ' Light' : ' Dark';
+  const chips = $('#chips'); chips.replaceChildren();
+  let total = 0, anyLive = false;
+  for (const p of s.platforms) {
+    const c = document.createElement('span'), d = document.createElement('span'), t = document.createElement('span');
+    c.className = 'chip'; d.className = 'dot' + (p.connected ? ' on' : '');
+    t.className = p.tag.toLowerCase(); t.textContent = p.tag;
+    c.append(d, t, document.createTextNode(p.viewers == null ? ' offline' : ' ' + p.viewers.toLocaleString()));
+    c.title = p.connected ? 'Connected' : 'Not connected';
+    chips.append(c);
+    if (p.viewers != null) { total += p.viewers; anyLive = true; }
+  }
+  if (s.platforms.length > 1 && anyLive) {
+    const c = document.createElement('span'); c.className = 'chip'; c.textContent = 'Total ' + total.toLocaleString(); chips.append(c);
+  }
+  const k = s.keys;
+  $('#ytState').textContent = k.youtube.ready ? '✓ Keys saved' : 'Not set up';
+  $('#ytState').className = 'state' + (k.youtube.ready ? ' done' : '');
+  $('#twState').textContent = k.twitch.ready ? '✓ Keys saved' : 'Not set up';
+  $('#twState').className = 'state' + (k.twitch.ready ? ' done' : '');
+  for (const [id, val] of [['#ytId', k.youtube.client_id], ['#twId', k.twitch.client_id], ['#twChan', k.twitch.channel]])
+    if (document.activeElement !== $(id) && val != null && $(id).dataset.shown !== val) { $(id).value = val; $(id).dataset.shown = val; }
+  if (document.activeElement !== $('#ytSecret')) $('#ytSecret').placeholder = k.youtube.has_secret ? '•••••••• saved' : 'GOCSPX-…';
+  $('#setupDone').disabled = !(k.youtube.ready || k.twitch.ready || s.running);
+  $('#setupDone').title = $('#setupDone').disabled ? 'Save keys for YouTube or Twitch first' : '';
+}
+
+let seq = 0;  // events are numbered in Python, so a reload (after visiting a setup page) replays, never repeats
+
+function handle(e) {
+  if (e.type === 'msg') addMessage(e);
+  else if (e.type === 'status') addStatus(e);
+  else if (e.type === 'alert') addAlert(e);
+  else if (e.type === 'signin') addSignin(e);
+  else if (e.type === 'signedin') document.getElementById('signin-' + e.platform)?.remove();
+}
+
+async function pump() {
+  try {
+    const r = await api().poll(seq);
+    r.events.forEach(handle);
+    seq = r.seq;
+    renderState(r.state);
+  } catch (err) { /* the window is switching to a setup page; try again next tick */ }
+  setTimeout(pump, 150);
+}
+
+function updateCount() {
+  const n = $('#msg').value.trim().length;
+  $('#count').textContent = n + '/' + MAX; $('#count').classList.toggle('over', n > MAX);
+}
+async function send() {
+  const text = $('#msg').value.trim();
+  if (!text || text.length > MAX) return;
+  $('#msg').value = ''; updateCount();
+  await api().send(text);
+}
+
+$('#msg').addEventListener('input', updateCount);
+$('#msg').addEventListener('keydown', e => { if (e.key === 'Enter') send(); });
+$('#sendBtn').onclick = send;
+$('#themeBtn').onclick = () => api().toggle_theme();
+$('#minBtn').onclick = () => api().window_cmd('min');
+$('#maxBtn').onclick = () => api().window_cmd('max');
+$('#closeBtn').onclick = () => api().window_cmd('close');
+for (const g of document.querySelectorAll('[data-edge]')) g.addEventListener('mousedown', e => {
+  if (e.button !== 0 || e.target !== g) return;  // a corner shouldn't also start a top-edge drag
+  e.preventDefault();
+  api().begin_resize(g.dataset.edge);
+});
+$('#setupBtn').onclick = () => show('setup');
+// one button: starts any platform whose keys were just saved (already-running ones are left alone), then shows chat
+$('#setupDone').onclick = async () => { const r = await api().finish_setup(); if (r.ok) show('chat'); };
+for (const b of document.querySelectorAll('[data-page]')) b.onclick = () => api().open_page(b.dataset.page);
+for (const b of document.querySelectorAll('[data-save]')) b.onclick = async () => {
+  const p = b.dataset.save, err = p === 'youtube' ? $('#ytErr') : $('#twErr');
+  const vals = p === 'youtube' ? { client_id: $('#ytId').value, client_secret: $('#ytSecret').value }
+                               : { client_id: $('#twId').value, channel: $('#twChan').value };
+  const r = await api().save_keys(p, vals);
+  err.textContent = r.ok ? '' : r.error;
+  if (r.ok && p === 'youtube') $('#ytSecret').value = '';
+};
+
+async function init() {
+  if (ready || !(window.pywebview && window.pywebview.api && window.pywebview.api.hello)) return;
+  ready = true;
+  const first = await api().hello();
+  if (!first) { ready = false; return setTimeout(init, 300); }  // Python wasn't ready for us yet
+  first.events.forEach(handle);
+  seq = first.seq;
+  show(first.view);
+  requestAnimationFrame(() => $('#log').scrollTop = $('#log').scrollHeight);
+  pump();
+}
+// pywebviewready can fire before this script runs, so also try straight away
+window.addEventListener('pywebviewready', init);
+init();
+</script>
+</body>
+</html>

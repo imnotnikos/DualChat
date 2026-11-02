@@ -17,6 +17,8 @@ DualChat is a lightweight **Windows** app for streamers who go live on **YouTube
 ***
 
 ## Features
+**Set Up Inside the App**: No files to edit. The setup screen opens each Google and Twitch page right inside the DualChat window, below a DualChat bar with the step to follow. DualChat grabs your keys automatically as they appear, and sign-in codes are filled in for you.
+
 **One Chat, Both Platforms**: YouTube and Twitch messages appear together, each line tagged and colored by platform.
 
 **One Box Replies to Both**: Type once and press Enter. The message goes to YouTube and Twitch at the same time.
@@ -27,52 +29,53 @@ DualChat is a lightweight **Windows** app for streamers who go live on **YouTube
 
 **Color Emoji**: Emoji, including skin tones, flags and combined emoji, show in full color.
 
-**Light & Dark Mode**: Switch with the **☀ Light / ☾ Dark** button in the top bar. The app remembers your choice.
+**Custom Title Bar**: The header is the title bar. It has live viewer chips, connection dots, a red-to-purple accent line and custom minimize, maximize and close buttons. Drag it to move the window, with Windows snapping, and double-click it to maximize. The edges still resize. On the Google and Twitch setup pages, a bar across the top takes over with the same window buttons, **Open In Browser** and **◀ Back**. The page fits below it at any window size.
+
+**Light & Dark Mode**: Switch with the **☀ Light / ☾ Dark** button in the header. Scrollbars and everything else follow the theme, and the app remembers your choice.
 
 **Sharp on Any Display**: Text stays crisp at 125%, 150% and higher Windows scaling.
 
 **Low API Usage**: YouTube chat comes in over one connection that stays open instead of constant checking, so a typical stream uses only about 250–350 of YouTube's 10,000 free daily API units per hour.
 
 ## Requirements
-Windows 10 or 11.
+Windows 10 or 11 with Microsoft Edge WebView2. It's built into Windows 11 and installed on almost every Windows 10 PC.
 
-A free Google Cloud project with the YouTube Data API turned on, and a free Twitch developer app. Setup steps are below.
+A free Google Cloud project and a free Twitch developer app. DualChat walks you through both on first launch.
 
 # Installation
 ## For Streamers
 Navigate to the Releases page.
 
-Download the latest `DualChat.exe` and `config.example.json` into the same folder.
+Download the latest `DualChat.exe` and put it in its own folder, for example `Documents\DualChat`.
 
-Rename `config.example.json` to `config.json` and add your own keys. **[SETUP.md](SETUP.md) walks you through it step by step.**
-
-Run `DualChat.exe`. On first launch it opens a sign-in page for each platform and shows a code in the chat window. After that, your logins are remembered.
+Run it. The first time, the **Connect your accounts** screen opens. Click each step's **Open** button, and that page loads right inside DualChat. When a key appears on screen, DualChat saves it. Then click **Go to chat** and approve the two sign-ins.
 
 ## Setup
-The .exe contains **no accounts or keys**. Each streamer connects their own, free:
+The .exe contains **no accounts or keys**. Each streamer connects their own, for free:
 
 - **YouTube:** a Google Cloud project with **YouTube Data API v3** turned on and an OAuth client of type **TVs and Limited Input devices**.
-- **Twitch:** a developer app with client type **Public** and redirect URL `http://localhost`.
+- **Twitch:** a developer app with client type **Public**, category **Chat Bot** and redirect URL `http://localhost`.
 
-Your keys go in `config.json` next to `DualChat.exe`. Your sign-ins are saved to `tokens.json` in the same folder. **[SETUP.md](SETUP.md)** covers every click, the config fields, keeping your keys private, and troubleshooting.
+Your keys are saved to `config.json` and your sign-ins to `tokens.json`, both next to `DualChat.exe`. You can reopen setup any time with **⚙ Setup**. **[SETUP.md](SETUP.md)** walks through every step, how to paste keys by hand, keeping them private, and troubleshooting.
 
 ## Good to Know
 - Messages are limited to 200 characters, which is YouTube's limit.
 - YouTube only reports new subscribers whose subscriptions are **public**, and it can take a few minutes. Member alerts arrive as fast as chat.
 - Anyone who already followed or subscribed before you opened the app is ignored. Only new ones get a popup.
 - While your Google app is in "Testing" mode, Google signs you out after 7 days, so you'll sign in to YouTube again about once a week.
-- Emoji images come from [Twemoji](https://github.com/jdecked/twemoji). Each one is downloaded the first time it appears. Offline, emoji fall back to plain text.
+- Google and Twitch sign-ins made inside DualChat's setup pages are kept in `%LOCALAPPDATA%\DualChat\webview`, separate from your normal browser. Delete that folder to sign them out.
 - `config.json` and `tokens.json` hold your keys and logins. Never share or commit them. Both are in `.gitignore`.
+- Country flag emoji use the [Twemoji Country Flags](https://github.com/talkjs/country-flag-emoji-polyfill) font, because Windows' emoji font has no flags. The artwork is from [Twemoji](https://github.com/jdecked/twemoji), licensed [CC BY 4.0](https://creativecommons.org/licenses/by/4.0/), used unmodified. See `assets/TwemojiCountryFlags-LICENSE.md`.
 
 ## Building
-Requires Python 3 with `pillow` and `pyinstaller`.
+Requires Python 3 with `pywebview` and `pyinstaller` (plus `pillow` only to redraw the icon).
 
-    pip install pillow pyinstaller
+    pip install pywebview pyinstaller
     python -m unittest test_dualchat
-    python -m PyInstaller --onefile --windowed --name DualChat --noconfirm --clean --distpath dist --workpath build --specpath build --icon "$PWD\dualchat.ico" --add-data "$PWD\dualchat.ico;." dualchat.py
+    python -m PyInstaller --onefile --windowed --name DualChat --noconfirm --clean --distpath dist --workpath build --specpath build --icon "$PWD\dualchat.ico" --add-data "$PWD\dualchat.ico;." --add-data "$PWD\ui.html;." --add-data "$PWD\assets\icon.png;assets" --add-data "$PWD\assets\TwemojiCountryFlags.woff2;assets" dualchat.py
 
 Output: `dist\DualChat.exe`
 
-Run it from source with `python dualchat.py`. The icon comes from `make_icon.py`, and the banner is `assets/social-preview.html` rendered at 1280×640.
+Run it from source with `python dualchat.py`. The window is `ui.html`, the icon comes from `make_icon.py`, and the banner is `assets/social-preview.html` rendered at 1280×640.
 
 For how it all works and what was fixed along the way, see [REPORT.md](REPORT.md).
