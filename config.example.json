@@ -1,0 +1,10 @@
+{
+  "youtube": {
+    "client_id": "YOUR_GOOGLE_CLIENT_ID.apps.googleusercontent.com",
+    "client_secret": "YOUR_GOOGLE_CLIENT_SECRET"
+  },
+  "twitch": {
+    "client_id": "YOUR_TWITCH_CLIENT_ID",
+    "channel": ""
+  }
+}
