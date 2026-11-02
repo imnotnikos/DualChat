@@ -27,7 +27,8 @@ d.polygon(p(0.29, 0.31, 0.29, 0.59, 0.51, 0.45), fill=RED)  # play button
 for x in (0.6, 0.71):  # Twitch-style "eyes"
     d.rounded_rectangle(p(x, 0.32, x + 0.065, 0.53), radius=round(0.02 * S), fill=PURPLE)
 
-big = icon.resize((256, 256), Image.Resampling.LANCZOS)
-big.save(HERE / "dualchat.ico", sizes=[(n, n) for n in (16, 20, 24, 32, 40, 48, 64, 128, 256)])
-big.save(HERE / "dualchat.png")
-print("wrote dualchat.ico and dualchat.png")
+icon.resize((256, 256), Image.Resampling.LANCZOS).save(
+    HERE / "dualchat.ico", sizes=[(n, n) for n in (16, 20, 24, 32, 40, 48, 64, 128, 256)])
+(HERE / "assets").mkdir(exist_ok=True)
+icon.resize((512, 512), Image.Resampling.LANCZOS).save(HERE / "assets" / "icon.png")  # README + social preview
+print("wrote dualchat.ico and assets/icon.png")

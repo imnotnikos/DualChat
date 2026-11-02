@@ -1,0 +1,34 @@
+<!doctype html>
+<html><head><meta charset="utf-8">
+<style>
+  html, body { margin: 0; width: 1280px; height: 640px; overflow: hidden; }
+  body {
+    font-family: "Segoe UI", system-ui, sans-serif; color: #fff;
+    background: radial-gradient(circle at 10% 18%, rgba(230,33,23,.55) 0, transparent 42%),
+                radial-gradient(circle at 90% 88%, rgba(145,70,255,.65) 0, transparent 50%),
+                linear-gradient(135deg, #1B1220 0%, #22173A 55%, #2A1C55 100%);
+    display: flex; align-items: center; gap: 64px; padding: 0 96px; box-sizing: border-box; position: relative;
+  }
+  img { width: 270px; height: 270px; filter: drop-shadow(0 24px 40px rgba(0,0,0,.45)); }
+  h1 { font-size: 84px; margin: 0 0 10px; letter-spacing: -1.5px; }
+  p { font-size: 31px; margin: 0 0 36px; color: #E3D9FF; max-width: 760px; line-height: 1.3; }
+  .tags { display: flex; gap: 14px; font-size: 22px; font-weight: 600; }
+  .chip { background: rgba(255,255,255,.10); border: 2px solid rgba(255,255,255,.28); padding: 9px 20px; border-radius: 999px; }
+  .yt { border-color: #FF5A4E; color: #FFB3AC; }
+  .tw { border-color: #B48CFF; color: #D9C6FF; }
+  .by { position: absolute; left: 430px; bottom: 54px; font-size: 22px; color: rgba(255,255,255,.62); }
+</style></head>
+<body>
+  <img src="icon.png" alt="">
+  <div>
+    <h1>DualChat</h1>
+    <p>YouTube and Twitch live chat in one window.<br>Type once, reply to both.</p>
+    <div class="tags">
+      <span class="chip yt">YouTube</span>
+      <span class="chip tw">Twitch</span>
+      <span class="chip">Viewer counts</span>
+      <span class="chip">Sub &amp; follow alerts</span>
+    </div>
+  </div>
+  <div class="by">by imNikos · github.com/imnotnikos</div>
+</body></html>
