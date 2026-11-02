@@ -44,24 +44,17 @@ Navigate to the Releases page.
 
 Download the latest `DualChat.exe` and `config.example.json` into the same folder.
 
-Rename `config.example.json` to `config.json` and fill it in (see **Setup**).
+Rename `config.example.json` to `config.json` and add your own keys. **[SETUP.md](SETUP.md) walks you through it step by step.**
 
 Run `DualChat.exe`. On first launch it opens a sign-in page for each platform and shows a code in the chat window. After that, your logins are remembered.
 
 ## Setup
-In `config.json`, any platform you leave on its `YOUR_...` placeholder is skipped, so you can use just one platform.
+The .exe contains **no accounts or keys**. Each streamer connects their own, free:
 
-### YouTube
-1. Go to https://console.cloud.google.com, create a project, and enable **YouTube Data API v3**.
-2. Open **Google Auth Platform**, choose **External**, and add your own Google account as a test user.
-3. Create an **OAuth client** of type **TVs and Limited Input devices**, and copy its client ID and secret into `config.json`.
+- **YouTube:** a Google Cloud project with **YouTube Data API v3** turned on and an OAuth client of type **TVs and Limited Input devices**.
+- **Twitch:** a developer app with client type **Public** and redirect URL `http://localhost`.
 
-### Twitch
-1. Go to https://dev.twitch.tv/console/apps and click **Register Your Application**.
-2. Set the redirect URL to `http://localhost`, category **Chat Bot**, client type **Public**.
-3. Copy the Client ID into `config.json`. Leave `channel` empty to use your own channel.
-
-Start your stream before or after launching. The app checks for a live YouTube broadcast every 60 seconds.
+Your keys go in `config.json` next to `DualChat.exe`. Your sign-ins are saved to `tokens.json` in the same folder. **[SETUP.md](SETUP.md)** covers every click, the config fields, keeping your keys private, and troubleshooting.
 
 ## Good to Know
 - Messages are limited to 200 characters, which is YouTube's limit.
